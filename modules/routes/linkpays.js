@@ -1,4 +1,3 @@
-
 module.exports.load = async function (
     express, session, passport, version, DiscordStrategy, bodyParser, figlet,
     sqlite3, fs, chalk, path, app, router, settings, DB_FILE_PATH, PORT, theme, randomstring,
@@ -8,8 +7,10 @@ module.exports.load = async function (
     joinDiscordGuild, sendDiscordWebhook, assignDiscordRole, registerPteroUser, getUserIdByUUID, getUserServersCount, getUserServers, getUserCoins, getUserResources, updatePasswordInPanel,
     updateUserCoins, fetchAllocations
 ) {
+    // Create required tables
     await db.run(`CREATE TABLE IF NOT EXISTS dailylinkpays (user_id TEXT PRIMARY KEY, total INTEGER)`);
     await db.run(`CREATE TABLE IF NOT EXISTS lvlimitdate (user_id TEXT PRIMARY KEY, timestamp INTEGER)`);
+
     const lpcodes = {};
     const cooldowns = {};
 
@@ -22,26 +23,40 @@ module.exports.load = async function (
         return code;
     }
 
-    const callbackUrl = settings.discord.oauth2.callbackpath;
-    const parsedUrl = new URL(callbackUrl);
-    const domain = `${parsedUrl.protocol}//${parsedUrl.host}`; 
-
-    app.get('/extra/linkpays/generate', async (req, res) => {
-        if (!req.session.user || !req.session.user.pterodactyl_id) {
-            return res.redirect('/');
+    // Build proper domain URL
+    let domain;
+    try {
+        const callbackUrl = settings.discord.oauth2.callbackpath;
+        if (!callbackUrl.startsWith('http://') && !callbackUrl.startsWith('https://')) {
+            domain = new URL(callbackUrl, settings.pterodactyl.domain).origin;
+        } else {
+            const parsedUrl = new URL(callbackUrl);
+            domain = `${parsedUrl.protocol}//${parsedUrl.host}`;
         }
+    } catch (err) {
+        console.error('Invalid callback URL in settings.json:', err.message);
+        process.exit(1);
+    }
+
+    // Ensure numeric values
+    const minTimeToComplete = settings.linkpays.minTimeToComplete ? Number(settings.linkpays.minTimeToComplete) : 0;
+    const cooldownMinutes = settings.linkpays.cooldown ? Number(settings.linkpays.cooldown) : 1;
+
+    // Generate linkpays link
+    app.get('/extra/linkpays/generate', async (req, res) => {
+        if (!req.session.user || !req.session.user.pterodactyl_id) return res.redirect('/');
 
         const userId = req.session.user.id;
 
         if (cooldowns[userId] && cooldowns[userId] > Date.now()) {
-            const remainingTime = Math.ceil((cooldowns[userId] - Date.now()) / 1000); // Remaining time in seconds
+            const remainingTime = Math.ceil((cooldowns[userId] - Date.now()) / 1000);
             return res.redirect(`/extra?alert=Cooldown remaining time ${remainingTime} s`);
         } else if (cooldowns[userId]) {
             delete cooldowns[userId];
         }
 
         const userCode = generateUserCode();
-        lpcodes[req.session.user.id] = {
+        lpcodes[userId] = {
             code: userCode,
             generated: Date.now(),
             redeemed: false
@@ -66,10 +81,11 @@ module.exports.load = async function (
         }
     });
 
+    // Redeem linkpays link
     app.get('/extra/linkpays/redeem/:code', async (req, res) => {
-        if (!req.session.user || !req.session.user.pterodactyl_id) {
-            return res.redirect('/');
-        }
+        if (!req.session.user || !req.session.user.pterodactyl_id) return res.redirect('/');
+
+        const userId = req.session.user.pterodactyl_id;
 
         if (cooldowns[req.session.user.id] && cooldowns[req.session.user.id] > Date.now()) {
             return res.redirect('/extra');
@@ -77,23 +93,20 @@ module.exports.load = async function (
             delete cooldowns[req.session.user.id];
         }
 
-        const userId = req.session.user.pterodactyl_id;
         const code = req.params.code;
-        if (!code) {
-            return res.send('<body style="background-color: #1b1c1d;"><center><h1 style="color: white">Error Code: HCLP001</h1><br><h2 style="color: white">You can get more information about this code on our <a style="color: white" href="https://discord.gg/CvqRH9TrYK">support</a> server!</h2></center>');
-        }
         const usercode = lpcodes[req.session.user.id];
-        if (!usercode) return res.redirect('/extra');
-        if (usercode.code !== code) return res.redirect('/extra');
-        if (usercode.redeemed) return res.redirect('/extra');
+
+        if (!code || !usercode || usercode.code !== code || usercode.redeemed) {
+            return res.redirect('/extra');
+        }
 
         usercode.redeemed = true;
 
-        if (((Date.now() - usercode.generated) / 1000) < settings.linkpays.minTimeToComplete) {
+        if (((Date.now() - usercode.generated) / 1000) < minTimeToComplete) {
             return res.send('<body style="background-color: #1b1c1d;"><center><h1 style="color: white">Error Code: HCLP002</h1><br><h2 style="color: white">You can get more information about this code on our <a style="color: white" href="https://discord.gg/CvqRH9TrYK">support</a> server!</h2></center>');
         }
 
-        cooldowns[req.session.user.id] = Date.now() + settings.linkpays.cooldown * 60 * 1000;
+        cooldowns[req.session.user.id] = Date.now() + cooldownMinutes * 60 * 1000;
 
         const getDailyLinkPaysStmt = db.prepare(`SELECT total FROM dailylinkpays WHERE user_id = ?`);
         getDailyLinkPaysStmt.get(req.session.user.id, async (err, row) => {
@@ -117,7 +130,7 @@ module.exports.load = async function (
             getDailyLinkPaysStmt.finalize();
         });
 
-        const newCoins = settings.linkpays.coins;
+        const newCoins = Number(settings.linkpays.coins) || 0;
         await updateUserCoins(userId, newCoins, db);
 
         res.redirect('/extra?success=SUCCESSLINKPAYS');
